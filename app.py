@@ -6,6 +6,11 @@ import re
 import tempfile
 from pathlib import Path
 
+# Ensure Homebrew binaries (ffmpeg/ffprobe) are on PATH
+for p in ["/opt/homebrew/bin", "/usr/local/bin"]:
+    if p not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = p + ":" + os.environ.get("PATH", "")
+
 import fitz  # PyMuPDF
 import gradio as gr
 import httpx
@@ -22,13 +27,13 @@ HOST_B_VOICE = os.environ.get("HOST_B_VOICE", "")
 
 SCRIPT_MODEL = "claude-sonnet-4-20250514"
 MAX_PDF_PAGES = 50
-SILENCE_MS = 400
+SILENCE_MS = 250
 
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "edge")  # "fish", "openrouter", or "edge" (free)
 
-# Edge-TTS voices (free, no API key)
-EDGE_VOICE_A = "en-US-GuyNeural"
-EDGE_VOICE_B = "en-US-JennyNeural"
+# Edge-TTS voices (free, no API key) — Indian English
+EDGE_VOICE_A = "en-IN-PrabhatNeural"       # Arjun / Host A (male)
+EDGE_VOICE_B = "en-IN-NeerjaExpressiveNeural"  # Priya / Host B (female, expressive)
 
 
 # --- Step 1: PDF → Structured Text ---
@@ -48,21 +53,28 @@ def extract_pdf_text(pdf_path: str) -> str:
 
 
 # --- Step 2: Text → Conversation Script ---
-SCRIPT_PROMPT = """You are a podcast script writer. Convert the following document into a natural, engaging conversation between two hosts:
+SCRIPT_PROMPT = """You are a podcast script writer. Convert the following document into a deep, thorough, and engaging conversation between two Indian hosts:
 
-- **Alex** (Host A): Curious, asks good questions, makes analogies to everyday things
-- **Sam** (Host B): The expert, explains clearly, gives key numbers and insights
+- **Arjun** (Host A): Curious, witty, relatable. Asks sharp follow-up questions, uses everyday Indian analogies (cricket, chai, Bangalore traffic, startup culture, JEE prep, etc.), occasionally plays devil's advocate. Uses natural Indian English expressions like "yaar", "basically", "see the thing is", "no but seriously", "that's actually insane", "wait wait wait".
+- **Priya** (Host B): The expert. Brilliant explainer, breaks down complex ideas with vivid examples. Uses phrases like "so here's the interesting part", "think of it this way", "exactly, and that's why", "the beauty of this is". Gives specific numbers and data from the paper.
 
 Rules:
-- 8-15 turns total
-- Each turn: 1-3 sentences. Natural speech, not reading aloud.
-- Cover the main ideas, skip boilerplate
-- Start with Alex introducing the topic in one excited sentence
-- End with Sam giving the "one thing to remember" takeaway
-- Sound like two friends talking, not a lecture
+- 25-40 turns total — this should feel like a full podcast episode
+- Each turn: 2-5 sentences. Conversational, like two IIT friends catching up over chai.
+- Use natural filler words and reactions: "hmm", "right right", "oh wow", "okay so", "achha", "haan"
+- Cover ALL major sections, findings, methodology, and conclusions
+- Go deep: explain the WHY behind findings, not just the WHAT
+- Arjun should ask "okay but real talk, what does this actually mean for..." type questions
+- Priya should use concrete analogies Indians would get — compare scale to Indian cities, use cricket/Bollywood/startup metaphors
+- Include genuine reactions — surprise, skepticism, excitement
+- Start with Arjun setting up the topic casually
+- Middle: walk through core ideas, with Arjun pushing for clarity and real-world relevance
+- End with implications, limitations, and a compelling takeaway
+- Sound like a real conversation, not a script. Interruptions and building on each other's points are good.
+- Do NOT use Hindi words beyond the natural expressions listed above
 
 Output ONLY valid JSON — an array of objects:
-[{"speaker": "Alex", "text": "..."}, {"speaker": "Sam", "text": "..."}, ...]
+[{"speaker": "Arjun", "text": "..."}, {"speaker": "Priya", "text": "..."}, ...]
 
 No markdown fences, no commentary."""
 
@@ -158,7 +170,7 @@ def _script_via_openai(text: str) -> list[dict]:
 def _script_via_ollama(text: str, model: str | None = None) -> list[dict]:
     model = model or OLLAMA_MODEL
     # 8B models need shorter input to leave room for output
-    ollama_limit = 12_000
+    ollama_limit = 24_000
     if len(text) > ollama_limit:
         text = text[:ollama_limit] + "\n\n[...truncated for brevity]"
 
@@ -172,7 +184,7 @@ def _script_via_ollama(text: str, model: str | None = None) -> list[dict]:
                     {"role": "user", "content": f"Here is the document:\n\n{text}"},
                 ],
                 "stream": False,
-                "options": {"num_predict": 4096, "temperature": 0.7},
+                "options": {"num_predict": 8192, "temperature": 0.7},
             },
             timeout=300,
         )
@@ -209,14 +221,15 @@ def _parse_script(raw: str) -> list[dict]:
 
 # --- Step 3: Script → Audio ---
 def synthesize_speech(text: str, speaker: str) -> bytes:
+    is_host_a = speaker in ("Alex", "Arjun")
     if TTS_BACKEND == "fish":
-        voice_id = HOST_A_VOICE if speaker == "Alex" else HOST_B_VOICE
+        voice_id = HOST_A_VOICE if is_host_a else HOST_B_VOICE
         return _tts_fish_audio(text, voice_id)
     elif TTS_BACKEND == "openrouter":
-        voice_id = HOST_A_VOICE if speaker == "Alex" else HOST_B_VOICE
+        voice_id = HOST_A_VOICE if is_host_a else HOST_B_VOICE
         return _tts_openrouter(text, voice_id)
     else:
-        voice = EDGE_VOICE_A if speaker == "Alex" else EDGE_VOICE_B
+        voice = EDGE_VOICE_A if is_host_a else EDGE_VOICE_B
         return _tts_edge(text, voice)
 
 
@@ -257,15 +270,36 @@ def _tts_openrouter(text: str, voice_id: str) -> bytes:
 
 
 def _tts_edge(text: str, voice: str) -> bytes:
-    """Free TTS via edge-tts (Microsoft Edge, no API key needed)."""
+    """Free TTS via edge-tts with SSML prosody for natural speech."""
     import asyncio
     import edge_tts
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp.close()
 
+    # Add natural pauses after punctuation and slight rate variation
+    ssml_text = text
+    ssml_text = ssml_text.replace("...", '<break time="400ms"/>')
+    ssml_text = ssml_text.replace(". ", '. <break time="200ms"/>')
+    ssml_text = ssml_text.replace("? ", '? <break time="300ms"/>')
+    ssml_text = ssml_text.replace("! ", '! <break time="200ms"/>')
+    # Pause after filler words for naturalness
+    for filler in ["hmm,", "right right,", "okay so,", "achha,", "haan,"]:
+        ssml_text = ssml_text.replace(filler, filler + ' <break time="250ms"/>')
+
+    rate = "+5%" if voice == EDGE_VOICE_A else "+0%"
+    pitch = "+0Hz" if voice == EDGE_VOICE_A else "+2Hz"
+
+    ssml = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-IN">
+  <voice name="{voice}">
+    <prosody rate="{rate}" pitch="{pitch}">
+      {ssml_text}
+    </prosody>
+  </voice>
+</speak>"""
+
     async def _generate():
-        communicate = edge_tts.Communicate(text, voice)
+        communicate = edge_tts.Communicate(ssml, voice)
         await communicate.save(tmp.name)
 
     asyncio.run(_generate())
