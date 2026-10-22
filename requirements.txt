@@ -1,0 +1,7 @@
+pymupdf
+gradio
+httpx
+pydub
+edge-tts
+anthropic
+openai
